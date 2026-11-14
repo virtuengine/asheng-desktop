@@ -1,0 +1,12 @@
+name: probe-mac
+on:
+  workflow_dispatch:
+jobs:
+  ping:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: uname -m

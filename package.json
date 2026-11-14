@@ -1,0 +1,14 @@
+{
+  "name": "asheng-desktop",
+  "private": true,
+  "version": "1.0.4",
+  "description": "阿盛桌面端 · 盛峰门业",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icon": "tauri icon"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

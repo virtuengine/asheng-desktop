@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>阿盛</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:transparent;overflow:hidden;
+    display:grid;place-items:center;
+    -webkit-user-select:none;user-select:none}
+  #ball{
+    width:72px;height:72px;border-radius:50%;cursor:pointer;position:relative;
+    display:grid;place-items:center;
+    background:radial-gradient(circle at 34% 26%, #ffffff 0%, #f2fbfc 44%, #d5eff2 100%);
+    border:1px solid rgba(15,163,163,.42);
+    box-shadow:
+      inset 0 2px 4px rgba(255,255,255,.95),
+      inset 0 -8px 14px rgba(11,111,114,.16),
+      0 2px 5px rgba(20,35,60,.14),
+      0 8px 18px rgba(15,140,150,.18);
+    animation:asgBreath 3.8s ease-in-out infinite;
+    transition:transform .22s ease, box-shadow .22s ease, filter .22s ease;
+  }
+  #ball:hover{
+    animation:none;
+    transform:scale(1.03);
+    filter:brightness(1.03);
+    box-shadow:
+      inset 0 2px 4px rgba(255,255,255,.95),
+      inset 0 -8px 14px rgba(11,111,114,.10),
+      inset 0 0 16px 2px rgba(15,163,163,.28),
+      0 4px 10px rgba(20,35,60,.18),
+      0 14px 28px rgba(15,140,150,.26);
+  }
+  #ball img{
+    width:52px;height:52px;object-fit:contain;pointer-events:none;-webkit-user-drag:none;
+    mix-blend-mode:multiply;transition:transform .22s ease;
+  }
+  #ball:hover img{transform:scale(1.06)}
+  /* 常驻：一圈很慢的青色弧线，静止时也能看出这是可交互的入口 */
+  #ball::before{
+    content:"";position:absolute;inset:3px;border-radius:50%;
+    background:conic-gradient(from 0deg,
+      rgba(15,163,163,0) 0deg,
+      rgba(15,163,163,0) 205deg,
+      rgba(15,163,163,.60) 315deg,
+      rgba(15,163,163,0) 360deg);
+    -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+    mask:radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+    opacity:.55;
+    animation:asgRing 9s linear infinite;
+    pointer-events:none;
+  }
+  /* 悬停：主弧线加快，再叠一圈反向弧线，和静止态区分开 */
+  #ball:hover::before{opacity:1;animation-duration:1.8s}
+  #ball .ring{
+    position:absolute;inset:1px;border-radius:50%;pointer-events:none;opacity:0;
+    background:conic-gradient(from 180deg,
+      rgba(11,111,114,0) 0deg,
+      rgba(11,111,114,0) 225deg,
+      rgba(11,111,114,.78) 330deg,
+      rgba(11,111,114,0) 360deg);
+    -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
+    mask:radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
+    transition:opacity .18s ease;
+  }
+  #ball:hover .ring{opacity:1;animation:asgRing 2.6s linear infinite reverse}
+  /* 在线标：绿点 + 白描边；呼吸光环用独立元素做缩放，走合成层不占 CPU */
+  #ball::after{
+    content:"";position:absolute;right:12px;bottom:12px;width:10px;height:10px;
+    border-radius:50%;background:#00d093;border:2px solid #fff;box-sizing:content-box;
+  }
+  #ball .halo{
+    position:absolute;right:14px;bottom:14px;width:10px;height:10px;border-radius:50%;
+    background:rgba(0,208,147,.45);pointer-events:none;
+    animation:asgHalo 2.6s ease-out infinite;
+  }
+  @keyframes asgRing{to{transform:rotate(360deg)}}
+  @keyframes asgBreath{
+    0%,100%{
+      box-shadow:
+        inset 0 2px 4px rgba(255,255,255,.95),
+        inset 0 -8px 14px rgba(11,111,114,.12),
+        0 2px 5px rgba(20,35,60,.14),
+        0 8px 18px rgba(15,140,150,.16);
+    }
+    50%{
+      box-shadow:
+        inset 0 2px 4px rgba(255,255,255,.95),
+        inset 0 -8px 14px rgba(11,111,114,.20),
+        inset 0 0 12px 1px rgba(15,163,163,.22),
+        0 3px 7px rgba(20,35,60,.15),
+        0 10px 22px rgba(15,140,150,.24);
+    }
+  }
+  @keyframes asgHalo{
+    0%{transform:scale(1);opacity:.6}
+    70%{transform:scale(2.4);opacity:0}
+    100%{transform:scale(2.4);opacity:0}
+  }
+  @media (prefers-reduced-motion: reduce){
+    #ball{animation:none;transition:none}
+    #ball::before{animation:none}
+    #ball:hover::before{animation:none}
+    #ball .ring{animation:none}
+    #ball .halo{animation:none;opacity:0}
+  }
+</style>
+</head>
+<body>
+  <div id="ball" aria-label="问阿盛：点击打开对话，拖动可移动，右键有菜单">
+    <i class="halo" aria-hidden="true"></i>
+    <i class="ring" aria-hidden="true"></i>
+    <img src="asg-logo.png" alt="阿盛">
+  </div>
+<script>
+(function(){
+  var el = document.getElementById('ball');
+  var api = window.__TAURI__ || {};
+  var invoke = api.core && api.core.invoke;
+  var win = api.window && api.window.getCurrentWindow ? api.window.getCurrentWindow() : null;
+
+  var sx = 0, sy = 0, dragging = false, pressed = false, resetTimer = null;
+
+  el.addEventListener('mousedown', function(e){
+    if (e.button !== 0) return;
+    e.preventDefault();
+    pressed = true; dragging = false;
+    sx = e.screenX; sy = e.screenY;
+  });
+
+  window.addEventListener('mousemove', function(e){
+    if (!pressed || dragging) return;
+    if (Math.abs(e.screenX - sx) > 4 || Math.abs(e.screenY - sy) > 4) {
+      dragging = true;
+      if (win && win.startDragging) win.startDragging().catch(function(){});
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(function(){ pressed = false; dragging = false; }, 1200);
+    }
+  });
+
+  window.addEventListener('mouseup', function(){
+    if (!pressed) return;
+    pressed = false;
+    if (!dragging && invoke) { invoke('toggle_panel').catch(function(){}); }
+    dragging = false;
+  });
+
+  el.addEventListener('contextmenu', function(e){
+    e.preventDefault();
+    if (invoke) { invoke('ball_menu').catch(function(){}); }
+  });
+})();
+</script>
+</body>
+</html>

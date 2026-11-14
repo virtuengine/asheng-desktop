@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>阿盛需要使用麦克风，把您说的话转成文字后再提问。</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.business</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

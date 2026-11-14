@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>阿盛 · 盛峰门业</title>
+<style>
+  /* 与 ERP 同一套规范：主蓝 #3C6AFF / 深蓝 #304EEB / 正文 #222 / 辅助 #777C92 / 圆角 3–4px */
+  :root{
+    --brand:#3c6aff; --brand-dark:#304eeb; --brand-soft:#ebf0ff;
+    --ink:#222222; --text:#333333; --muted:#777c92; --placeholder:#979cb1;
+    --line:#e4e7ee; --bg:#f5f7fa;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    display:grid;place-items:center;padding:24px;color:var(--ink);
+    background:
+      radial-gradient(760px 420px at 18% 0%, rgba(60,106,255,.07) 0%, transparent 62%),
+      var(--bg);
+    font-family:"Source Han Sans SC","Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    font-size:14px;
+  }
+  .card{
+    width:100%;max-width:400px;padding:32px 28px 26px;text-align:center;
+    background:#fff;border:1px solid var(--line);border-radius:4px;
+    box-shadow:0 4px 16px rgba(34,34,34,.08);
+  }
+  .logo{width:60px;height:60px;object-fit:contain;margin-bottom:12px}
+  h1{margin:0;font-size:16px;font-weight:600;color:var(--ink)}
+  .sub{margin:6px 0 0;font-size:12px;color:var(--muted)}
+  .status{
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    margin:24px 0 6px;min-height:20px;font-size:14px;color:var(--text);
+  }
+  .spinner{
+    display:none;width:16px;height:16px;border-radius:50%;
+    border:2px solid #dbe4ff;border-top-color:var(--brand);
+    animation:spin .8s linear infinite;
+  }
+  .dot{display:none;width:8px;height:8px;border-radius:50%;background:#fb465b}
+  .is-loading .spinner{display:block}
+  .is-fail .dot{display:block}
+  .is-fail .status{color:#e63e52}
+  #retry{
+    display:none;width:100%;margin-top:18px;padding:0 16px;height:36px;
+    border:1px solid var(--brand);border-radius:3px;
+    background:var(--brand);color:#fff;font-size:14px;font-family:inherit;cursor:pointer;
+  }
+  #retry:hover{background:var(--brand-dark);border-color:var(--brand-dark)}
+  #skip{
+    display:none;margin-top:12px;padding:0;border:0;background:none;cursor:pointer;
+    font-family:inherit;font-size:12px;color:var(--placeholder);
+    text-decoration:underline;text-underline-offset:3px;
+  }
+  #skip:hover{color:var(--brand)}
+  .is-fail #retry{display:block}
+  .is-fail #skip{display:inline-block}
+  .hint{display:none;margin:14px 0 0;font-size:12px;line-height:1.7;color:var(--placeholder)}
+  .is-fail .hint{display:block}
+  @media (prefers-reduced-motion: reduce){.spinner{animation:none}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+  <main class="card is-loading" id="card">
+    <img class="logo" src="asg-logo.png" alt="阿盛">
+    <h1>阿盛 · 盛峰门业</h1>
+    <p class="sub">生产数据与智能助手</p>
+    <div class="status" aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="dot" aria-hidden="true"></span>
+      <span id="statusText">正在连接生产服务器…</span>
+    </div>
+    <button id="retry" type="button">重新连接</button>
+    <button id="skip" type="button">仍要尝试打开</button>
+    <p class="hint">如果一直连不上，请联系管理员。网络或服务器证书异常时也会停在这一页。</p>
+    <noscript>需要启用 JavaScript 才能连接生产服务器。</noscript>
+  </main>
+<script>
+(function(){
+  var TARGET = window.__ASHENG_TARGET__ || 'https://43.142.55.26:8668/erp/';
+  var card = document.getElementById('card');
+  var statusText = document.getElementById('statusText');
+  var retry = document.getElementById('retry');
+  var skip = document.getElementById('skip');
+  var probing = false;
+
+  function go(){
+    location.replace(TARGET);
+  }
+  function showLoading(){
+    card.classList.add('is-loading');
+    card.classList.remove('is-fail');
+    statusText.textContent = '正在连接生产服务器…';
+  }
+  function showFail(){
+    card.classList.remove('is-loading');
+    card.classList.add('is-fail');
+    statusText.textContent = '连不上生产服务器';
+  }
+
+  // 用 ERP 自己的 favicon 做连通性探测：走 WebView2 的网络栈，带系统代理和证书校验
+  function probe(){
+    if (probing) return;
+    probing = true;
+    showLoading();
+
+    var done = false;
+    var img = new Image();
+    var timer = setTimeout(function(){ finish(false); }, 3000);
+
+    function finish(ok){
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      probing = false;
+      if (ok) { go(); } else { showFail(); }
+    }
+
+    img.onload = function(){ finish(true); };
+    img.onerror = function(){ finish(false); };
+    img.src = new URL('favicon.ico?_=' + Date.now(), TARGET).href;
+  }
+
+  retry.addEventListener('click', probe);
+  skip.addEventListener('click', go);
+  window.addEventListener('online', function(){
+    if (card.classList.contains('is-fail')) probe();
+  });
+  probe();
+})();
+</script>
+</body>
+</html>

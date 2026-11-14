@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ball",
+  "description": "桌面悬浮球：允许拖动与调用应用命令",
+  "windows": ["ball"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}

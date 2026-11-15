@@ -288,6 +288,18 @@ fn main() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
+                // 对话框关闭只收起，不销毁：销毁会留下停靠/跟随等脏状态，之后再也打不开
+                if window.label() == ASK_LABEL {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    ASK_ARMED.store(false, Ordering::SeqCst);
+                    ASK_FOLLOW.store(false, Ordering::SeqCst);
+                    if DOCKED.swap(false, Ordering::SeqCst) {
+                        restore_main_width(window.app_handle());
+                    }
+                    ball_sync(window.app_handle());
+                    return;
+                }
                 // 主窗口点关闭只收进托盘，不退出
                 if window.label() == MAIN_LABEL {
                     api.prevent_close();
@@ -362,6 +374,17 @@ fn main() {
                         }
                     }
                     schedule_align(window.app_handle());
+                }
+            }
+            // 兜底：对话框被其他途径销毁时，同样复位状态并让球回来
+            WindowEvent::Destroyed => {
+                if window.label() == ASK_LABEL {
+                    ASK_ARMED.store(false, Ordering::SeqCst);
+                    ASK_FOLLOW.store(false, Ordering::SeqCst);
+                    if DOCKED.swap(false, Ordering::SeqCst) {
+                        restore_main_width(window.app_handle());
+                    }
+                    ball_sync(window.app_handle());
                 }
             }
             WindowEvent::Focused(focused) => {
@@ -872,6 +895,17 @@ fn collapse_dock(app: &AppHandle) {
     if DOCK_GUARD.swap(true, Ordering::SeqCst) {
         return;
     }
+    restore_main_width(app);
+    DOCK_GUARD.store(false, Ordering::SeqCst);
+    log_line(app, "停靠面板已收起，ERP 恢复宽度");
+    ball_sync(app);
+}
+
+/// 解除停靠后把 ERP 宽度还原（不依赖对话框窗口是否存在）
+fn restore_main_width(app: &AppHandle) {
+    let Some(main) = app.get_webview_window(MAIN_LABEL) else {
+        return;
+    };
     if let Some((mx, my, _mw, mh)) = logical_rect(&main) {
         let scale = main.scale_factor().unwrap_or(1.0);
         let inner_h = main
@@ -884,9 +918,6 @@ fn collapse_dock(app: &AppHandle) {
         let _ = main.set_size(tauri::Size::Logical(tauri::LogicalSize::new(target, inner_h)));
         let _ = main.set_position(tauri::LogicalPosition::new(mx, my));
     }
-    DOCK_GUARD.store(false, Ordering::SeqCst);
-    log_line(app, "停靠面板已收起，ERP 恢复宽度");
-    ball_sync(app);
 }
 
 /* --------------------------- 悬浮球位置（贴 ERP / 回桌面） --------------------------- */
@@ -1478,6 +1509,12 @@ fn show_main(app: &AppHandle) {
 }
 
 fn toggle_ask(app: &AppHandle) {
+    // 脏状态兜底：停靠标记还在但对话框已不存在 → 复位并还原 ERP 宽度，继续走创建流程
+    if DOCKED.load(Ordering::SeqCst) && app.get_webview_window(ASK_LABEL).is_none() {
+        DOCKED.store(false, Ordering::SeqCst);
+        restore_main_width(app);
+        log_line(app, "停靠状态残留，已复位");
+    }
     // 已停靠：热键就是收起/展开右侧面板，ERP 宽度跟着伸缩
     if DOCKED.load(Ordering::SeqCst) {
         if !erp_up(app) {

@@ -246,6 +246,19 @@ try {
     if (-not $m.url -or -not $m.sha256) { throw '清单内容不完整' }
     $total = [long]$m.size
 
+    # 已装且内容一致：升级安装包但语音模块没变时不重复下载
+    $stampPath = Join-Path $Dest '.ok'
+    $exePath = Join-Path $Dest 'asr-host.exe'
+    if ((Test-Path -LiteralPath $stampPath) -and (Test-Path -LiteralPath $exePath)) {
+        try {
+            $old = Get-Content -LiteralPath $stampPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($old.sha256 -and ([string]$old.sha256).ToLower() -eq ([string]$m.sha256).ToLower()) {
+                Close-Ui
+                exit 0
+            }
+        } catch {}
+    }
+
     # 下载文件放在 Dest 同级，先保证父目录存在
     $parent = Split-Path -Parent $Dest
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {

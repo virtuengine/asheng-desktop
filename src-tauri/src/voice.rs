@@ -358,7 +358,7 @@ fn locate_models(app: &AppHandle, exe: &Path) -> Result<PathBuf, String> {
     Err("找不到语音模型文件，请重新安装阿盛桌面端".into())
 }
 
-/// macOS 没有安装器钩子：首次开启语音时按芯片下载语音资源包，校验后解压到应用数据目录
+/// macOS 没有安装器钩子：按芯片下载语音资源包，校验后解压到应用数据目录
 #[cfg(not(windows))]
 fn ensure_voice_pack(app: &AppHandle) -> Result<(), String> {
     let root = app
@@ -366,24 +366,72 @@ fn ensure_voice_pack(app: &AppHandle) -> Result<(), String> {
         .app_data_dir()
         .map_err(|e| format!("找不到应用数据目录：{}", e))?
         .join("asr");
-    let ready = root.join(".ok").exists()
-        && root.join("asr-host").exists()
-        && root.join("models").join("vad").join("silero_vad.onnx").exists();
-    if ready {
-        return Ok(());
-    }
     let arch = if cfg!(target_arch = "aarch64") {
         "arm64"
     } else {
         "x86_64"
     };
-    let url = format!(
+    let manifest_url = format!(
         "https://43.142.55.26:8668/dl/desktop/voice-pack-mac-{}.json",
         arch
     );
+
+    // 先取清单：本地版本和云端不一致就重新下载，升级客户端后能自动换掉旧语音包
+    let resp = ureq::get(&manifest_url)
+        .timeout(Duration::from_secs(30))
+        .call()
+        .map_err(|e| format!("获取语音模块信息失败：{}", e))?;
+    let info: Value = resp
+        .into_json()
+        .map_err(|e| format!("语音模块信息解析失败：{}", e))?;
+    let version = info
+        .get("version")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = info
+        .get("url")
+        .and_then(|x| x.as_str())
+        .ok_or("语音模块下载地址缺失")?
+        .to_string();
+    let sha = info
+        .get("sha256")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let marker: Value = std::fs::read_to_string(root.join(".ok"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    let local_sha = marker.get("sha256").and_then(|x| x.as_str()).unwrap_or("");
+    let local_version = marker.get("version").and_then(|x| x.as_str()).unwrap_or("");
+    let same_pack = if sha.is_empty() {
+        local_version == version
+    } else {
+        local_sha == sha
+    };
+    let ready = same_pack
+        && root.join("asr-host").exists()
+        && root.join("models").join("vad").join("silero_vad.onnx").exists();
+    if ready {
+        return Ok(());
+    }
+
     paint_text("语音：正在下载模块…");
-    log_line(app, "首次开启语音，开始下载语音模块（约 33MB）");
-    let result = download_voice_pack(&root, &url);
+    log_line(
+        app,
+        &format!(
+            "下载语音模块 {}（约 30MB，本地 {}）",
+            version,
+            if local_version.is_empty() {
+                "无"
+            } else {
+                local_version
+            }
+        ),
+    );
+    let result = download_voice_pack(&root, &url, &sha, &version);
     paint(ENABLED.load(Ordering::SeqCst));
     if result.is_ok() {
         log_line(app, "语音模块下载完成");
@@ -392,25 +440,8 @@ fn ensure_voice_pack(app: &AppHandle) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn download_voice_pack(root: &Path, manifest_url: &str) -> Result<(), String> {
+fn download_voice_pack(root: &Path, url: &str, sha: &str, version: &str) -> Result<(), String> {
     use std::io::{Cursor, Read};
-
-    let resp = ureq::get(manifest_url)
-        .timeout(Duration::from_secs(30))
-        .call()
-        .map_err(|e| format!("获取语音模块信息失败：{}", e))?;
-    let info: Value = resp
-        .into_json()
-        .map_err(|e| format!("语音模块信息解析失败：{}", e))?;
-    let url = info
-        .get("url")
-        .and_then(|x| x.as_str())
-        .ok_or("语音模块下载地址缺失")?;
-    let sha = info
-        .get("sha256")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_lowercase();
 
     let resp = ureq::get(url)
         .timeout(Duration::from_secs(300))
@@ -462,7 +493,9 @@ fn download_voice_pack(root: &Path, manifest_url: &str) -> Result<(), String> {
             let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
         }
     }
-    std::fs::write(root.join(".ok"), b"ok").map_err(|e| format!("写入完成标记失败：{}", e))?;
+    let marker = json!({ "version": version, "sha256": sha });
+    std::fs::write(root.join(".ok"), marker.to_string())
+        .map_err(|e| format!("写入完成标记失败：{}", e))?;
     Ok(())
 }
 

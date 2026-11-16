@@ -6,8 +6,6 @@
 !define VOICE_MANIFEST "https://43.142.55.26:8668/dl/desktop/voice-pack.json"
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; 已装过的（覆盖安装/升级）不重复下载
-  IfFileExists "$INSTDIR\asr\.ok" voice_done
   ; 静默安装不下载，避免无人值守时卡在这里
   IfSilent voice_done
 

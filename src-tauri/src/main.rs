@@ -3,7 +3,7 @@
 // 阿盛桌面端 · 第一版（P0）
 // 形态：主窗口加载现有大屏页面 + 托盘常驻 + Ctrl+Alt+A 快捷小窗 + 开机自启 + 版本检查
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -96,6 +96,10 @@ static ASK_HOTKEY: Mutex<Option<Shortcut>> = Mutex::new(None);
 static QUIT_HOTKEY: Mutex<Option<Shortcut>> = Mutex::new(None);
 // 小窗是否真正获得过焦点（没获得过就别自动收，否则刚弹出就消失）
 static ASK_ARMED: AtomicBool = AtomicBool::new(false);
+// 小窗探活：每次点击记一个序号，页面导航回来才算活着；超时没回应就重建
+static ASK_PROBE: AtomicI64 = AtomicI64::new(0);
+static ASK_PROBED: AtomicI64 = AtomicI64::new(0);
+static ASK_RECOVERING: AtomicBool = AtomicBool::new(false);
 // 小窗是否正在创建（避免连点重复建窗）
 static ASK_CREATING: AtomicBool = AtomicBool::new(false);
 // 主窗口是否已切到工作尺寸（登录页用紧凑尺寸，登录后放大）
@@ -1137,6 +1141,8 @@ fn navigation_guard(app: AppHandle) -> impl Fn(&tauri::Url) -> bool + Send + 'st
         }
         // 小窗登录态探测：1=已登录，0=未登录
         if url.path() == "/ask/state/1" || url.path() == "/ask/state/0" {
+            // 页面还活着：给探活序号回执，避免被当成失效页面重建
+            ASK_PROBED.store(ASK_PROBE.load(Ordering::SeqCst), Ordering::SeqCst);
             let q = url.query().unwrap_or("");
             // 顺手把登录令牌交给语音模块；日志里不落令牌
             for kv in q.split('&') {
@@ -1609,7 +1615,33 @@ fn toggle_ask(app: &AppHandle) {
             ball_sync(app);
         } else {
             // 先把登录态探出来：已登录才显示，未登录切主窗口
+            let seq = ASK_PROBE.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = w.eval(JS_ASK_AUTH_NOW);
+            // 开机自启时可能还没网，小窗停在错误页，点它没有任何反应；超时就重建一个
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1600));
+                if ASK_PROBED.load(Ordering::SeqCst) >= seq
+                    || ASK_RECOVERING.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+                log_line(&handle, "快捷小窗无响应，按页面失效重建");
+                if let Some(w) = handle.get_webview_window(ASK_LABEL) {
+                    let _ = w.close();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let created = create_ask(&handle).is_some();
+                ASK_RECOVERING.store(false, Ordering::SeqCst);
+                log_line(
+                    &handle,
+                    if created {
+                        "快捷小窗已重建"
+                    } else {
+                        "快捷小窗重建失败"
+                    },
+                );
+            });
         }
         return;
     }

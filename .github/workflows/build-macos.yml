@@ -37,7 +37,7 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 -o vp.zip "$CDN/voice-pack-$PACK_VERSION.zip"
           mkdir -p asr-host/models
           unzip -o -q vp.zip 'models/*' -d asr-host/
-          ls -lh asr-host/models/vad asr-host/models/voice
+          ls -lh asr-host/models/sensevoice asr-host/models/kws asr-host/models/vad
 
       - name: Build asr-host
         run: |
@@ -50,8 +50,7 @@ jobs:
           cp -R dist/asr-host/* pack/asr/
           cp -R asr-host/models pack/asr/models
           chmod +x pack/asr/asr-host
-          cd pack && zip -q -r -y "../voice-pack-mac-${{ matrix.arch }}.zip" asr
-          cd ..
+          (cd pack/asr && zip -q -r -y "../../voice-pack-mac-${{ matrix.arch }}.zip" .)
           shasum -a 256 "voice-pack-mac-${{ matrix.arch }}.zip" | tee sha-${{ matrix.arch }}.txt
           du -sh "voice-pack-mac-${{ matrix.arch }}.zip"
 

@@ -256,6 +256,8 @@ fn ensure_host(app: &AppHandle) -> Result<(), String> {
     // 子进程输出落到应用数据目录，出问题时能直接看日志
     if let Ok(dir) = app.path().app_data_dir() {
         let _ = std::fs::create_dir_all(&dir);
+        // 埋点队列与设备标识也放这里，卸载前一直保留
+        cmd.env("ASHENG_DATA_DIR", &dir);
         if let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -267,6 +269,8 @@ fn ensure_host(app: &AppHandle) -> Result<(), String> {
             }
         }
     }
+    // 上报埋点时带上客户端版本，后台能区分是哪一版的数据
+    cmd.env("ASHENG_APP_VERSION", app.package_info().version.to_string());
     log_line(app, &format!("启动语音服务：{}", exe.display()));
     let child = cmd
         .spawn()

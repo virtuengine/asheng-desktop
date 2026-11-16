@@ -23,9 +23,11 @@ import queue
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -115,23 +117,30 @@ DEFAULT_RULES = {
 }
 
 
-def is_exit_intent(text: str, rules: dict | None = None) -> bool:
-    """分层判断用户是不是在结束对话；业务问句优先，宁可不退也不误退。"""
+def exit_decision(text: str, rules: dict | None = None) -> tuple[bool, str]:
+    """分层判断并返回命中层，埋点里用来统计是哪一层在生效。"""
     r = (rules or DEFAULT_RULES)["exit"]
     t = text.strip().strip("，,。.！!？?、~ ")
     if not t:
-        return False
+        return False, "空输入"
     if any(w in t for w in r["biz"]):
-        return False
+        return False, "业务保护词"
     if len(t) > r["max_len"]:
-        return False
-    if any(w in t for w in r["words"]):
-        return True
+        return False, "超出长度"
     if any(p in t for p in r["phrases"]):
-        return True
+        return True, "告别句式"
+    if any(w in t for w in r["words"]):
+        return True, "核心退出词"
     if any(q in t for q in r["questions"]):
-        return False
-    return len(t) <= r["short_len"] and any(v in t for v in r["verbs"]) and t[-1] in r["tails"]
+        return False, "疑问词保护"
+    if len(t) <= r["short_len"] and any(v in t for v in r["verbs"]) and t[-1] in r["tails"]:
+        return True, "短句判定"
+    return False, "未命中"
+
+
+def is_exit_intent(text: str, rules: dict | None = None) -> bool:
+    """分层判断用户是不是在结束对话；业务问句优先，宁可不退也不误退。"""
+    return exit_decision(text, rules)[0]
 
 
 # 识别由服务端中转（腾讯云 / 阿里云），本地只做录音和静音检测
@@ -169,6 +178,157 @@ def ssl_context():
     except Exception:
         _SSL_CONTEXT = ssl.create_default_context()
     return _SSL_CONTEXT
+
+
+# ---------- 端侧埋点 ----------
+# 只记时延、结果、命中层；不上传音频，也不上传对话原文。
+METRIC_FLUSH_SECONDS = 30.0
+METRIC_BATCH = 100
+APP_VERSION = os.environ.get("ASHENG_APP_VERSION", "").strip()
+
+
+def _metric_dir() -> Path:
+    """埋点队列与设备标识的落盘目录：优先用桌面端传进来的数据目录。"""
+    for env in ("ASHENG_METRIC_DIR", "ASHENG_DATA_DIR"):
+        raw = os.environ.get(env, "").strip()
+        if not raw:
+            continue
+        try:
+            path = Path(raw)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            continue
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or ""
+    if base:
+        try:
+            path = Path(base) / "asheng-desktop"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            pass
+    try:
+        path = Path(sys.executable).resolve().parent / "data"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception:
+        return Path(tempfile.gettempdir())
+
+
+class Metrics:
+    """先落本地文件再批量上报：断网时留在本地，恢复后自动补发。"""
+
+    def __init__(self) -> None:
+        self.dir = _metric_dir()
+        self.queue_file = self.dir / "voice-metrics.jsonl"
+        self.id_file = self.dir / "client-id"
+        self.lock = threading.RLock()
+        self.client_id = self._load_id()
+        self.sent = 0
+        self.failed = 0
+        self.last_error = ""
+        self.last_ok_at = 0.0
+
+    def _load_id(self) -> str:
+        try:
+            raw = self.id_file.read_text(encoding="utf-8").strip()
+            if raw:
+                return raw
+        except Exception:
+            pass
+        value = uuid.uuid4().hex[:16]
+        try:
+            self.id_file.write_text(value, encoding="utf-8")
+        except Exception:
+            pass
+        return value
+
+    def add(self, event: str, **fields) -> None:
+        item = {"event": event, "ts": round(time.time(), 3)}
+        for key, value in fields.items():
+            if value is None or value == "":
+                continue
+            item[key] = value
+        line = json.dumps(item, ensure_ascii=False)
+        with self.lock:
+            try:
+                with self.queue_file.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except Exception as exc:
+                self.last_error = f"写入失败 {exc}"
+
+    def pending(self) -> int:
+        try:
+            with self.queue_file.open("r", encoding="utf-8") as fh:
+                return sum(1 for line in fh if line.strip())
+        except Exception:
+            return 0
+
+    def flush(self, endpoint: str, token: str) -> bool:
+        if not endpoint or not token:
+            return False
+        with self.lock:
+            try:
+                lines = [line for line in self.queue_file.read_text(encoding="utf-8").splitlines()
+                         if line.strip()]
+            except Exception:
+                return False
+            if not lines:
+                return True
+            # 长期离线兜底：只保留最近的 2000 条，避免队列无限增长
+            if len(lines) > 5000:
+                self._drop(len(lines) - 2000)
+                lines = lines[-2000:]
+            batch = lines[:METRIC_BATCH]
+        events = []
+        for line in batch:
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+        if not events:
+            self._drop(len(batch))
+            return True
+        body = json.dumps({
+            "client_id": self.client_id,
+            "app_version": APP_VERSION,
+            "events": events,
+        }, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=ssl_context()) as resp:
+                resp.read()
+        except Exception as exc:
+            with self.lock:
+                self.failed += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            return False
+        self._drop(len(batch))
+        with self.lock:
+            self.sent += len(events)
+            self.last_error = ""
+            self.last_ok_at = time.time()
+        return True
+
+    def _drop(self, count: int) -> None:
+        with self.lock:
+            try:
+                lines = self.queue_file.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                return
+            keep = lines[count:]
+            tmp = self.queue_file.with_suffix(".tmp")
+            try:
+                tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+                os.replace(tmp, self.queue_file)
+            except Exception as exc:
+                self.last_error = f"清理失败 {exc}"
+
 
 # 固定业务词的常见同音误识，统一改回正确写法
 FIXES = (
@@ -231,7 +391,19 @@ class AsrEngine:
         self.wake_vad = None
         # 唤醒后的应答音，让用户明确知道可以接着说了
         self._init_voice()
+        # 埋点：只统计时延与命中结果，音频和对话原文都不外传
+        self.metrics = Metrics()
+        self.session_id = ""
+        self.session_started = 0.0
+        self.session_turns = 0
+        self.session_empty = 0
+        self.last_interrupt_at = 0.0
+        self.text_since_interrupt = False
+        self.muted_at = 0.0
+        self.ack_started_at = 0.0
+        self.last_asr_ms = 0
         threading.Thread(target=self._rules_loop, daemon=True).start()
+        threading.Thread(target=self._metrics_loop, daemon=True).start()
 
     def _init_voice(self) -> None:
         base = self.models / "voice"
@@ -436,6 +608,7 @@ class AsrEngine:
 
     def play_ack(self) -> None:
         """唤醒应答：时段问候 + 隔久了带称呼 + 随机应答词。"""
+        self.ack_started_at = time.perf_counter()
         rules = self.rules
         clips = []
         greeting, greet_key = self._current_greeting()
@@ -536,6 +709,54 @@ class AsrEngine:
         with self.lock:
             return [e for e in self.events if e["id"] > since], self.seq
 
+    # ---------- 埋点 ----------
+    def track(self, event: str, **fields) -> None:
+        try:
+            fields.setdefault("session", self.session_id)
+            self.metrics.add(event, **fields)
+        except Exception:
+            pass
+
+    def _metrics_loop(self) -> None:
+        while self.running:
+            time.sleep(METRIC_FLUSH_SECONDS)
+            if not self.token:
+                continue
+            try:
+                self.metrics.flush(self._api_base() + "/voice/metrics", self.token)
+            except Exception as exc:
+                print(f"[asr-host] 埋点上报失败 {exc}", flush=True)
+
+    def _open_session(self) -> None:
+        if self.session_id:
+            return
+        self.session_id = uuid.uuid4().hex[:12]
+        self.session_started = time.time()
+        self.session_turns = 0
+        self.session_empty = 0
+        self.last_interrupt_at = 0.0
+        self.text_since_interrupt = False
+
+    def _close_session(self, reason: str) -> None:
+        if not self.session_id:
+            return
+        duration = time.time() - self.session_started if self.session_started else 0.0
+        # 打断后没等到有效提问，多半是把环境音当成了插话
+        if self.last_interrupt_at and not self.text_since_interrupt:
+            self.track("interrupt_miss", layer="打断后无有效提问")
+        self.track(
+            "conv_end",
+            reason=reason,
+            turns=self.session_turns,
+            detail={"dur_s": round(duration, 1), "empty": self.session_empty},
+        )
+        self.session_id = ""
+        self.session_started = 0.0
+        self.session_turns = 0
+        self.session_empty = 0
+        self.last_interrupt_at = 0.0
+        self.text_since_interrupt = False
+
     # ---------- 音频 ----------
     def ensure_stream(self) -> None:
         if self.stream is not None:
@@ -606,13 +827,19 @@ class AsrEngine:
             if self._too_quiet(seg):
                 continue
             try:
-                text = self.transcribe(seg)
+                text = self.transcribe(seg, source="wake")
             except Exception as exc:
                 print(f"[asr-host] 唤醒识别失败 {exc}", flush=True)
+                self.track("wake_miss", ok=False, reason="error")
                 continue
             if "阿胜" in text:
                 self._on_wake_text(text)
                 return
+            self.track(
+                "wake_miss", ok=False,
+                reason="no_keyword" if text else "empty",
+                ms=self.last_asr_ms, text_len=len(text),
+            )
 
     def _interrupt_feed(self, chunk: np.ndarray) -> None:
         """播报期间继续听：回放的声音也会被识别，但只有出现打断词才真正动作。"""
@@ -625,7 +852,7 @@ class AsrEngine:
             vad.pop()
             if self._too_quiet(seg):
                 continue
-            text = self.transcribe(seg)
+            text = self.transcribe(seg, source="interrupt")
             if not text:
                 continue
             self.emit("heard", text, source="interrupt")
@@ -635,9 +862,11 @@ class AsrEngine:
                 with self.lock:
                     self.muted = False
                     self.interrupt_vad = None
+                self.track("exit", ok=True, layer=exit_decision(text, self.rules)[1],
+                           text_len=len(text), detail={"during": "playing"})
                 self.emit("bye", text)
                 self.play_bye()
-                self.end_conversation()
+                self.end_conversation("bye")
                 return
             # 播报里本身可能说到「阿胜」，所以只认三种情况：
             # 1) 明确的打断词；2) 句首就是「阿胜」；3) 用户近场说话能量明显更高
@@ -649,6 +878,14 @@ class AsrEngine:
             stop_hit = any(w in text for w in self.rules["interrupt"]["stop"])
             if strong or head_hit or stop_hit:
                 print(f"[asr-host] 打断播报 rms={rms:.3f} 文本={text}", flush=True)
+                layer = "stop" if stop_hit else ("head" if head_hit else "rms")
+                self.track(
+                    "interrupt", ok=True, layer=layer,
+                    ms=int((time.time() - self.muted_at) * 1000) if self.muted_at else None,
+                    detail={"rms": round(rms, 3)},
+                )
+                self.last_interrupt_at = time.time()
+                self.text_since_interrupt = False
                 with self.lock:
                     self.muted = False
                     self.interrupt_vad = None
@@ -669,9 +906,20 @@ class AsrEngine:
             cmd = cmd.replace(token, "")
         cmd = cmd.strip(" ，。,.!?！？、")
         print(f"[asr-host] 唤醒识别 {text} -> 指令 {cmd!r}", flush=True)
+        # 同一轮对话里重新唤醒，先把上一段会话收尾再开新会话
+        self._close_session("rewake")
+        self._open_session()
+        self.track("wake", ok=True, ms=self.last_asr_ms, text_len=len(cmd),
+                   detail={"cmd": bool(len(cmd) >= 2)})
         self.emit("wake", "阿胜阿胜")
+        wake_at = time.perf_counter()
         self.play_ack()
+        ack_at = self.ack_started_at or wake_at
+        self.track("ack", ok=True, ms=int((ack_at - wake_at) * 1000),
+                   detail={"play_ms": int((time.perf_counter() - ack_at) * 1000)})
         if len(cmd) >= 2:
+            self.session_turns += 1
+            self.text_since_interrupt = True
             self.emit("text", cmd, source="wake")
         # 不管这句里有没有带问题，都进入收音，方便接着说
         self.begin_capture()
@@ -694,7 +942,7 @@ class AsrEngine:
             self.finish_capture()
         elif time.time() - self.capture_started > self.rules["conversation"]["idle"]:
             # 一段时间没人说话，结束这轮对话，回到待机
-            self.end_conversation()
+            self.end_conversation("idle")
 
     @staticmethod
     def _too_quiet(samples: np.ndarray) -> bool:
@@ -724,7 +972,7 @@ class AsrEngine:
             if samples:
                 arr = np.array(samples, dtype=np.float32)
                 if not self._too_quiet(arr):
-                    text = self.transcribe(arr)
+                    text = self.transcribe(arr, source="capture")
         except Exception as exc:  # 识别失败要让桌面端知道，不能静默
             self.emit("error", str(exc))
 
@@ -733,14 +981,18 @@ class AsrEngine:
             # 用户明确要结束，就别再回答，直接回待机
             if is_exit_intent(text, self.rules):
                 print(f"[asr-host] 用户结束对话：{text}", flush=True)
+                self.track("exit", ok=True, layer=exit_decision(text, self.rules)[1],
+                           text_len=len(text), detail={"during": "listening"})
                 self.emit("bye", text)
                 self.play_bye()
-                self.end_conversation()
+                self.end_conversation("bye")
                 return
             # 对话中又喊了唤醒词：重新应答，不把它当成问题发出去
             if "阿胜" in text:
                 self._on_wake_text(text)
                 return
+            self.session_turns += 1
+            self.text_since_interrupt = True
             self.emit("text", text, source="wake")
             self.conv_misses = 0
             self.resume_capture()
@@ -748,9 +1000,10 @@ class AsrEngine:
 
         # 有声音但没识别出内容，连续两次就认为用户走开了
         self.conv_misses += 1
+        self.session_empty += 1
         self.emit("empty")
         if self.conv_misses >= self.rules["conversation"]["misses"]:
-            self.end_conversation()
+            self.end_conversation("misses")
         else:
             self.resume_capture()
 
@@ -763,7 +1016,8 @@ class AsrEngine:
             self.wake_vad = self._new_wake_vad()
         self.capture_started = time.time()
 
-    def end_conversation(self) -> None:
+    def end_conversation(self, reason: str = "manual") -> None:
+        self._close_session(reason)
         with self.lock:
             self.capturing = False
             self.wake_vad = self._new_wake_vad()
@@ -786,7 +1040,7 @@ class AsrEngine:
             return None
         return np.concatenate(parts)
 
-    def transcribe(self, samples: np.ndarray) -> str:
+    def transcribe(self, samples: np.ndarray, source: str = "unknown") -> str:
         """上传到服务端中转识别，用哪家由管理后台切换。"""
         if not self.token:
             print("[asr-host] 还没有登录令牌，跳过识别", flush=True)
@@ -801,6 +1055,7 @@ class AsrEngine:
                 "Authorization": "Bearer " + self.token,
             },
         )
+        audio_s = round(len(samples) / SAMPLE_RATE, 2)
         t0 = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=25, context=ssl_context()) as resp:
@@ -809,11 +1064,16 @@ class AsrEngine:
             self.last_asr_error = f"{type(exc).__name__}: {exc}"
             print(f"[asr-host] 识别请求失败 {exc}", flush=True)
             self.online = False
+            self.last_asr_ms = int((time.perf_counter() - t0) * 1000)
+            self.track("asr_error", reason=type(exc).__name__, ms=self.last_asr_ms, layer=source)
             return ""
         self.online = True
         self.last_asr_error = ""
+        self.last_asr_ms = int((time.perf_counter() - t0) * 1000)
         text = normalize(str(data.get("text") or "").strip())
         self.last_heard = text
+        self.track("asr", ok=bool(text), ms=self.last_asr_ms, text_len=len(text),
+                   detail={"source": source, "audio_s": audio_s})
         print(
             f"[asr-host] {len(samples) / SAMPLE_RATE:.2f}s -> {text} "
             f"({(time.perf_counter() - t0) * 1000:.0f}ms)",
@@ -830,6 +1090,7 @@ class AsrEngine:
             self.wake_on = True
             self.emit("wake_on")
         else:
+            self._close_session("wake_off")
             self.wake_on = False
             with self.lock:
                 self.capturing = False
@@ -859,7 +1120,7 @@ class AsrEngine:
                 samples = samples[-int(SAMPLE_RATE * PTT_MAX_SECONDS):]
             speech = self.trim_speech(samples)
             if speech is not None:
-                text = self.transcribe(speech)
+                text = self.transcribe(speech, source="ptt")
         if not self.wake_on:
             self.close_stream()
         return {"text": text}
@@ -920,6 +1181,14 @@ class Handler(BaseHTTPRequestHandler):
                     "greetings": len(e.rules.get("greetings") or []),
                     "greeted": e.last_greeting_key,
                 },
+                "metrics": {
+                    "client": e.metrics.client_id,
+                    "app": APP_VERSION or "-",
+                    "sent": e.metrics.sent,
+                    "failed": e.metrics.failed,
+                    "pending": e.metrics.pending(),
+                    "error": e.metrics.last_error,
+                },
             })
             return
         if url.path == "/test/exit":
@@ -959,6 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.engine.muted = on
                 # 播报期间另起一个断句器，专门盯打断词
                 self.engine.interrupt_vad = self.engine._new_interrupt_vad() if on else None
+            self.engine.muted_at = time.time() if on else 0.0
             self._send(200, {"muted": on})
             return
         if url.path == "/config":

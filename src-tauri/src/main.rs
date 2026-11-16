@@ -18,6 +18,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
+mod voice;
+
 const MAIN_URL: &str = "https://43.142.55.26:8668/erp/";
 const ASK_URL: &str = "https://43.142.55.26:8668/ask/";
 const SCREEN_URL: &str = "https://43.142.55.26:8668/?client=1";
@@ -30,6 +32,27 @@ fn version_url() -> &'static str {
     } else {
         VERSION_URL_WIN
     }
+}
+
+/// 解析百分号编码（登录令牌里含 + / = 等字符，页面那边做了 encodeURIComponent）
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let high = (bytes[i + 1] as char).to_digit(16);
+            let low = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (high, low) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 const MAIN_LABEL: &str = "main";
 const ASK_LABEL: &str = "ask";
@@ -102,9 +125,10 @@ const JS_ASK_AUTH: &str = r#"(function(){
     window.__askProbed=1;
     var ok=false;
     try{ ok=!!(window.askHasLogin&&window.askHasLogin()); }catch(e){}
-    var len=0;
+    var len=0,tk='';
     try{ len=(localStorage.getItem('sf-erp-token')||localStorage.getItem('sf_token')||'').length; }catch(e){}
-    location.href='/ask/state/'+(ok?'1':'0')+'?len='+len+'&fn='+(typeof window.askHasLogin);
+    try{ tk=encodeURIComponent(localStorage.getItem('sf-erp-token')||localStorage.getItem('sf_token')||''); }catch(e){}
+    location.href='/ask/state/'+(ok?'1':'0')+'?len='+len+'&fn='+(typeof window.askHasLogin)+'&tk='+tk;
   }
   probe();
 })();"#;
@@ -112,9 +136,10 @@ const JS_ASK_AUTH: &str = r#"(function(){
 const JS_ASK_AUTH_NOW: &str = r#"(function(){
   var ok=false;
   try{ ok=!!(window.askHasLogin&&window.askHasLogin()); }catch(e){}
-  var len=0;
+  var len=0,tk='';
   try{ len=(localStorage.getItem('sf-erp-token')||localStorage.getItem('sf_token')||'').length; }catch(e){}
-  location.href='/ask/state/'+(ok?'1':'0')+'?len='+len+'&fn='+(typeof window.askHasLogin);
+  try{ tk=encodeURIComponent(localStorage.getItem('sf-erp-token')||localStorage.getItem('sf_token')||''); }catch(e){}
+  location.href='/ask/state/'+(ok?'1':'0')+'?len='+len+'&fn='+(typeof window.askHasLogin)+'&tk='+tk;
 })();"#;
 
 // 客户端里把页面滚动条收细成中性灰，和 ERP 的扁平规范一致
@@ -210,7 +235,11 @@ fn main() {
             } else {
                 prewarm_ball(app.handle());
             }
-            let ask_item = create_tray(app.handle())?;
+            let tray = create_tray(app.handle())?;
+            let ask_item = tray.ask;
+            if let Some(voice_item) = tray.voice {
+                voice::init(app.handle(), voice_item);
+            }
 
             // 逐个尝试快捷键，被别的软件占用就自动换下一个
             let mut picked: Option<(Shortcut, &'static str)> = None;
@@ -1098,10 +1127,16 @@ fn navigation_guard(app: AppHandle) -> impl Fn(&tauri::Url) -> bool + Send + 'st
         // 小窗登录态探测：1=已登录，0=未登录
         if url.path() == "/ask/state/1" || url.path() == "/ask/state/0" {
             let q = url.query().unwrap_or("");
-            log_line(
-                &app,
-                &format!("登录探测：{}{}", url.path(), if q.is_empty() { String::new() } else { format!("?{}", q) }),
-            );
+            // 顺手把登录令牌交给语音模块；日志里不落令牌
+            for kv in q.split('&') {
+                if let Some(tk) = kv.strip_prefix("tk=") {
+                    let tok = percent_decode(tk);
+                    if !tok.is_empty() {
+                        voice::set_token(&app, tok);
+                    }
+                }
+            }
+            log_line(&app, &format!("登录探测：{}", url.path()));
         }
         if url.path() == "/ask/state/1" {
             if let Some(w) = app.get_webview_window(ASK_LABEL) {
@@ -1330,30 +1365,49 @@ fn create_ball(app: &AppHandle) -> Option<WebviewWindow> {
     Some(w)
 }
 
-fn create_tray(app: &AppHandle) -> tauri::Result<MenuItem<tauri::Wry>> {
+struct TrayItems {
+    ask: MenuItem<tauri::Wry>,
+    // 语音组件只有 Windows 版，其他系统不显示这一项
+    voice: Option<MenuItem<tauri::Wry>>,
+}
+
+fn create_tray(app: &AppHandle) -> tauri::Result<TrayItems> {
+    use tauri::menu::IsMenuItem;
+
     // 防御：同名托盘已存在时先移除，避免托盘里出现两个图标
     let _ = app.remove_tray_by_id("asheng-tray");
     let open_i = MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)?;
     let ask_i = MenuItem::with_id(app, "ask", "问一句（Ctrl+Alt+A）", true, None::<&str>)?;
+    let voice_i = if cfg!(windows) {
+        Some(MenuItem::with_id(
+            app,
+            "voice",
+            "语音：关（点击开启）",
+            true,
+            None::<&str>,
+        )?)
+    } else {
+        None
+    };
     let ball_i = MenuItem::with_id(app, "ball", "显示/隐藏悬浮球", true, None::<&str>)?;
     let screen_i = MenuItem::with_id(app, "screen", "打开生产大屏（浏览器）", true, None::<&str>)?;
     let logout_i = MenuItem::with_id(app, "logout", "退出登录（换人）", true, None::<&str>)?;
     let check_i = MenuItem::with_id(app, "check", "检查更新", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &open_i,
-            &ask_i,
-            &ball_i,
-            &screen_i,
-            &logout_i,
-            &PredefinedMenuItem::separator(app)?,
-            &check_i,
-            &PredefinedMenuItem::separator(app)?,
-            &quit_i,
-        ],
-    )?;
+    let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&open_i, &ask_i];
+    if let Some(v) = &voice_i {
+        items.push(v);
+    }
+    items.push(&ball_i);
+    items.push(&screen_i);
+    items.push(&logout_i);
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    items.push(&sep1);
+    items.push(&check_i);
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    items.push(&sep2);
+    items.push(&quit_i);
+    let menu = Menu::with_items(app, &items)?;
 
     let icon = app
         .default_window_icon()
@@ -1368,6 +1422,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<MenuItem<tauri::Wry>> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main(app),
             "ask" => toggle_ask(app),
+            "voice" => voice::toggle(app),
             "ball" => toggle_ball((*app).clone()),
             "screen" => {
                 let _ = app.opener().open_url(SCREEN_URL, None::<&str>);
@@ -1391,11 +1446,15 @@ fn create_tray(app: &AppHandle) -> tauri::Result<MenuItem<tauri::Wry>> {
             }
         })
         .build(app)?;
-    Ok(ask_i)
+    Ok(TrayItems {
+        ask: ask_i,
+        voice: voice_i,
+    })
 }
 
 /// 退出应用：先摘掉托盘图标再退出，避免任务栏残留图标
 fn quit_app(app: &AppHandle) {
+    voice::shutdown();
     let _ = app.remove_tray_by_id("asheng-tray");
     app.exit(0);
 }

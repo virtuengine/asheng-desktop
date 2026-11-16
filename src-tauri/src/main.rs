@@ -194,6 +194,15 @@ fn main() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
+                    // macOS 的按住说话走全局快捷键，按下开始收音、松开提交
+                    if voice::ptt_shortcut().as_ref() == Some(shortcut) {
+                        match event.state() {
+                            ShortcutState::Pressed => voice::ptt_press(),
+                            ShortcutState::Released => voice::ptt_release(),
+                            _ => {}
+                        }
+                        return;
+                    }
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
@@ -242,6 +251,8 @@ fn main() {
             }
 
             // 逐个尝试快捷键，被别的软件占用就自动换下一个
+            #[cfg(not(windows))]
+            voice::register_ptt(app.handle());
             let mut picked: Option<(Shortcut, &'static str)> = None;
             for (hk, label) in ask_shortcut_candidates() {
                 match app.global_shortcut().register(hk.clone()) {
@@ -1367,7 +1378,6 @@ fn create_ball(app: &AppHandle) -> Option<WebviewWindow> {
 
 struct TrayItems {
     ask: MenuItem<tauri::Wry>,
-    // 语音组件只有 Windows 版，其他系统不显示这一项
     voice: Option<MenuItem<tauri::Wry>>,
 }
 
@@ -1378,17 +1388,13 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayItems> {
     let _ = app.remove_tray_by_id("asheng-tray");
     let open_i = MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)?;
     let ask_i = MenuItem::with_id(app, "ask", "问一句（Ctrl+Alt+A）", true, None::<&str>)?;
-    let voice_i = if cfg!(windows) {
-        Some(MenuItem::with_id(
-            app,
-            "voice",
-            "语音：关（点击开启）",
-            true,
-            None::<&str>,
-        )?)
-    } else {
-        None
-    };
+    let voice_i = Some(MenuItem::with_id(
+        app,
+        "voice",
+        "语音：关（点击开启）",
+        true,
+        None::<&str>,
+    )?);
     let ball_i = MenuItem::with_id(app, "ball", "显示/隐藏悬浮球", true, None::<&str>)?;
     let screen_i = MenuItem::with_id(app, "screen", "打开生产大屏（浏览器）", true, None::<&str>)?;
     let logout_i = MenuItem::with_id(app, "logout", "退出登录（换人）", true, None::<&str>)?;

@@ -40,6 +40,9 @@ static PTT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PTT_CANCEL: AtomicBool = AtomicBool::new(false);
 // 每次按下递增，用来作废旧的长按计时器（连按时不会误触发）
 static PTT_GEN: AtomicI64 = AtomicI64::new(0);
+// macOS 用系统全局快捷键代替低级键盘钩子（右 Option 按住说话）
+#[cfg(not(windows))]
+static PTT_HOTKEY: Mutex<Option<tauri_plugin_global_shortcut::Shortcut>> = Mutex::new(None);
 
 pub fn init(app: &AppHandle, item: MenuItem<Wry>) {
     if let Ok(mut g) = ITEM.lock() {
@@ -195,7 +198,11 @@ fn start(app: &AppHandle) -> Result<(), String> {
     save_pref(app, true);
     paint(true);
     start_poll(app.clone());
-    log_line(app, "语音已就绪：说「阿胜阿胜」，或按住右 Ctrl 说话");
+    let ptt = if cfg!(windows) { "右 Ctrl" } else { "右 Option" };
+    log_line(
+        app,
+        &format!("语音已就绪：说「阿胜阿胜」，或按住{}说话", ptt),
+    );
     Ok(())
 }
 
@@ -230,6 +237,9 @@ fn ensure_host(app: &AppHandle) -> Result<(), String> {
     }
     // 健康检查不通：可能上次异常退出的进程还挂着，先清掉再拉
     kill_host();
+    // macOS 没有安装器钩子，首次开启时把语音资源包下载到本机
+    #[cfg(not(windows))]
+    ensure_voice_pack(app)?;
     let exe = locate_exe(app)?;
     let models = locate_models(app, &exe)?;
     let mut cmd = Command::new(&exe);
@@ -269,9 +279,13 @@ fn kill_host() {
     }
 }
 
-/// 依次尝试：环境变量 → 安装目录 → 开发目录
+/// 依次尝试：环境变量 → 应用数据目录 → 安装目录 → 开发目录
 fn asr_dirs(app: &AppHandle) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    // macOS 下载的语音包放在应用数据目录
+    if let Ok(d) = app.path().app_data_dir() {
+        dirs.push(d.join("asr"));
+    }
     if let Ok(d) = app.path().resource_dir() {
         dirs.push(d.join("asr"));
         dirs.push(d.join("resources").join("asr"));
@@ -328,6 +342,114 @@ fn locate_models(app: &AppHandle, exe: &Path) -> Result<PathBuf, String> {
         }
     }
     Err("找不到语音模型文件，请重新安装阿盛桌面端".into())
+}
+
+/// macOS 没有安装器钩子：首次开启语音时按芯片下载语音资源包，校验后解压到应用数据目录
+#[cfg(not(windows))]
+fn ensure_voice_pack(app: &AppHandle) -> Result<(), String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("找不到应用数据目录：{}", e))?
+        .join("asr");
+    let ready = root.join(".ok").exists()
+        && root.join("asr-host").exists()
+        && root.join("models").join("vad").join("silero_vad.onnx").exists();
+    if ready {
+        return Ok(());
+    }
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    let url = format!(
+        "https://43.142.55.26:8668/dl/desktop/voice-pack-mac-{}.json",
+        arch
+    );
+    paint_text("语音：正在下载模块…");
+    log_line(app, "首次开启语音，开始下载语音模块（约 33MB）");
+    let result = download_voice_pack(&root, &url);
+    paint(ENABLED.load(Ordering::SeqCst));
+    if result.is_ok() {
+        log_line(app, "语音模块下载完成");
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn download_voice_pack(root: &Path, manifest_url: &str) -> Result<(), String> {
+    use std::io::{Cursor, Read};
+
+    let resp = ureq::get(manifest_url)
+        .timeout(Duration::from_secs(30))
+        .call()
+        .map_err(|e| format!("获取语音模块信息失败：{}", e))?;
+    let info: Value = resp
+        .into_json()
+        .map_err(|e| format!("语音模块信息解析失败：{}", e))?;
+    let url = info
+        .get("url")
+        .and_then(|x| x.as_str())
+        .ok_or("语音模块下载地址缺失")?;
+    let sha = info
+        .get("sha256")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let resp = ureq::get(url)
+        .timeout(Duration::from_secs(300))
+        .call()
+        .map_err(|e| format!("下载语音模块失败：{}", e))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("下载语音模块失败：{}", e))?;
+    if bytes.is_empty() {
+        return Err("下载到的语音模块为空".into());
+    }
+    if !sha.is_empty() {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(&bytes));
+        if got != sha {
+            return Err("语音模块校验失败，请重试".into());
+        }
+    }
+
+    if root.exists() {
+        std::fs::remove_dir_all(root).map_err(|e| format!("清理旧语音模块失败：{}", e))?;
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("创建语音目录失败：{}", e))?;
+
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("语音包解压失败：{}", e))?;
+    for i in 0..zip.len() {
+        let mut item = zip
+            .by_index(i)
+            .map_err(|e| format!("语音包读取失败：{}", e))?;
+        let rel = match item.enclosed_name() {
+            Some(p) => p.to_path_buf(),
+            None => continue,
+        };
+        let out = root.join(&rel);
+        if item.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("解压失败：{}", e))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("解压失败：{}", e))?;
+        }
+        let mut file = std::fs::File::create(&out).map_err(|e| format!("解压失败：{}", e))?;
+        std::io::copy(&mut item, &mut file).map_err(|e| format!("解压失败：{}", e))?;
+        #[cfg(unix)]
+        if rel == Path::new("asr-host") {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    std::fs::write(root.join(".ok"), b"ok").map_err(|e| format!("写入完成标记失败：{}", e))?;
+    Ok(())
 }
 
 // --------------------------- 与服务通信 ---------------------------
@@ -543,9 +665,49 @@ fn deliver(app: &AppHandle, text: &str) {
     });
 }
 
-// --------------------------- 按住右 Ctrl 说话 ---------------------------
+// --------------------------- 按住右 Ctrl / 右 Option 说话 ---------------------------
 
-#[cfg(windows)]
+#[cfg(not(windows))]
+pub fn register_ptt(app: &AppHandle) {
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
+
+    // Mac 键盘没有右 Ctrl，优先用右 Option（右 Alt）按住说话
+    for (code, label) in [(Code::AltRight, "右 Option"), (Code::ControlRight, "右 Ctrl")] {
+        let sc = Shortcut::new(None, code);
+        match app.global_shortcut().register(sc.clone()) {
+            Ok(_) => {
+                if let Ok(mut g) = PTT_HOTKEY.lock() {
+                    *g = Some(sc);
+                }
+                log_line(app, &format!("按住{}说话已就绪", label));
+                return;
+            }
+            Err(e) => log_line(app, &format!("按住{}说话不可用：{}", label, e)),
+        }
+    }
+    log_line(app, "按住说话不可用，可继续用唤醒词「阿胜阿胜」");
+}
+
+/// 当前平台的按住说话快捷键；Windows 走键盘钩子，不用全局快捷键
+pub fn ptt_shortcut() -> Option<tauri_plugin_global_shortcut::Shortcut> {
+    #[cfg(not(windows))]
+    {
+        PTT_HOTKEY.lock().ok().and_then(|g| g.clone())
+    }
+    #[cfg(windows)]
+    {
+        None
+    }
+}
+
+pub fn ptt_press() {
+    ptt_down();
+}
+
+pub fn ptt_release() {
+    ptt_up();
+}
+
 fn ptt_down() {
     if !ENABLED.load(Ordering::SeqCst) {
         return;
@@ -585,7 +747,6 @@ fn ptt_down() {
     });
 }
 
-#[cfg(windows)]
 fn ptt_up() {
     PTT_HELD.store(false, Ordering::SeqCst);
     PTT_CANCEL.store(false, Ordering::SeqCst);
@@ -706,13 +867,17 @@ fn save_pref(app: &AppHandle, on: bool) {
 }
 
 fn paint(on: bool) {
+    paint_text(if on {
+        "语音：开（说「阿胜阿胜」）"
+    } else {
+        "语音：关（点击开启）"
+    });
+}
+
+fn paint_text(text: &str) {
     if let Ok(g) = ITEM.lock() {
         if let Some(item) = g.as_ref() {
-            let _ = item.set_text(if on {
-                "语音：开（说「阿胜阿胜」）"
-            } else {
-                "语音：关（点击开启）"
-            });
+            let _ = item.set_text(text);
         }
     }
 }

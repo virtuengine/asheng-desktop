@@ -6,7 +6,7 @@ on:
 env:
   # 模型直接从我们自己的服务器取，避免 CI 访问 HuggingFace 不稳定
   CDN: https://43.142.55.26:8668/dl/desktop
-  PACK_VERSION: 1.2.0
+  PACK_VERSION: 1.2.1
 
 jobs:
   # 分别产出 Apple Silicon 与 Intel 的语音模块，客户端按芯片下载对应的一份
@@ -30,7 +30,7 @@ jobs:
       - name: Install python deps
         run: |
           python -m pip install --upgrade pip
-          pip install "sherpa-onnx==2.0.1" sounddevice numpy pyinstaller
+          pip install "sherpa-onnx==2.0.1" sounddevice numpy pyinstaller certifi
 
       - name: Fetch models
         run: |
@@ -42,7 +42,7 @@ jobs:
       - name: Build asr-host
         run: |
           python -m PyInstaller asr-host/asr_host.py --name asr-host --noconfirm --clean \
-            --collect-all sherpa_onnx --collect-all sounddevice --distpath dist
+            --collect-all sherpa_onnx --collect-all sounddevice --collect-all certifi --distpath dist
 
       - name: Pack
         run: |

@@ -151,6 +151,25 @@ def to_wav(samples: np.ndarray, rate: int = SAMPLE_RATE) -> bytes:
         w.writeframes(pcm.tobytes())
     return buf.getvalue()
 
+
+_SSL_CONTEXT = None
+
+
+def ssl_context():
+    """macOS 的 Python 默认找不到系统 CA，优先用随包携带的 certifi。"""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    import ssl
+
+    try:
+        import certifi
+
+        _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
+
 # 固定业务词的常见同音误识，统一改回正确写法
 FIXES = (
     ("压行线", "压型线"),
@@ -195,6 +214,7 @@ class AsrEngine:
         self.interrupt_vad = None
         self.last_heard = ""
         self.last_rms = 0.0
+        self.last_asr_error = ""
 
         # 识别改由服务端中转，本地只留录音和静音检测，启动更快、内存更省
         self.token = ""
@@ -281,7 +301,7 @@ class AsrEngine:
 
     def _http_get(self, url: str, timeout: float = 10.0) -> bytes:
         req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.token})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             return resp.read()
 
     def _rules_loop(self) -> None:
@@ -783,13 +803,15 @@ class AsrEngine:
         )
         t0 = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=25, context=ssl_context()) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
+            self.last_asr_error = f"{type(exc).__name__}: {exc}"
             print(f"[asr-host] 识别请求失败 {exc}", flush=True)
             self.online = False
             return ""
         self.online = True
+        self.last_asr_error = ""
         text = normalize(str(data.get("text") or "").strip())
         self.last_heard = text
         print(
@@ -888,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
                 "heard": e.last_heard,
                 "rms": round(e.last_rms, 3),
                 "error": e.last_error,
+                "asr_error": e.last_asr_error,
                 "rules": {
                     "version": e.rules.get("version") or "default",
                     "at": round(e.rules_at, 0),

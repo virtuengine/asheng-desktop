@@ -253,6 +253,20 @@ fn ensure_host(app: &AppHandle) -> Result<(), String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    // 子进程输出落到应用数据目录，出问题时能直接看日志
+    if let Ok(dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("asr-host.log"))
+        {
+            if let Ok(err) = file.try_clone() {
+                cmd.stdout(std::process::Stdio::from(file));
+                cmd.stderr(std::process::Stdio::from(err));
+            }
+        }
+    }
     log_line(app, &format!("启动语音服务：{}", exe.display()));
     let child = cmd
         .spawn()

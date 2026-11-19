@@ -603,10 +603,21 @@ fn start_poll(app: AppHandle) {
     });
 }
 
+/// 把语音状态推给悬浮球窗口：idle / listening / thinking
+fn ball_state(app: &AppHandle, state: &str) {
+    if let Some(ball) = app.get_webview_window("ball") {
+        let _ = ball.eval(&format!(
+            "window.__asgState&&window.__asgState('{}')",
+            state
+        ));
+    }
+}
+
 fn handle_event(app: &AppHandle, e: &Value) {
     match e.get("type").and_then(|x| x.as_str()).unwrap_or("") {
         "wake" => {
             log_line(app, "语音：听到唤醒词「阿胜阿胜」");
+            ball_state(app, "listening");
             ensure_ask(app);
         }
         "text" => {
@@ -619,18 +630,24 @@ fn handle_event(app: &AppHandle, e: &Value) {
             // 只认带实际文字的识别结果，纯标点（如「。」）是环境噪音的产物
             if text.chars().any(|c| c.is_alphanumeric()) {
                 log_line(app, &format!("语音识别：{}", text));
+                ball_state(app, "thinking");
                 deliver(app, &text);
             }
         }
-        "sleep" => log_line(app, "语音：这轮对话结束，回到待机"),
+        "sleep" => {
+            log_line(app, "语音：这轮对话结束，回到待机");
+            ball_state(app, "idle");
+        }
         "interrupt" => {
             log_line(app, "语音：收到打断，停止播报");
+            ball_state(app, "idle");
             if let Some(w) = app.get_webview_window(ASK_LABEL) {
                 let _ = w.eval("try{window.__asgStopSpeech&&window.__asgStopSpeech()}catch(e){}");
             }
         }
         "bye" => {
             log_line(app, "语音：用户结束了这轮对话");
+            ball_state(app, "idle");
             if let Some(w) = app.get_webview_window(ASK_LABEL) {
                 let _ = w.eval("try{window.__asgStopSpeech&&window.__asgStopSpeech()}catch(e){}");
             }

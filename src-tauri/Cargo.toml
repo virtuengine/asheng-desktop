@@ -1,6 +1,6 @@
 [package]
 name = "asheng-desktop"
-version = "1.2.4"
+version = "1.2.5"
 description = "阿盛桌面端 · 盛峰门业"
 authors = ["Shengfeng"]
 edition = "2021"
